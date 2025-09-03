@@ -1,0 +1,6 @@
+streamlit
+pandas
+python-barcode
+reportlab
+supabase
+python-dotenv

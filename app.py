@@ -56,7 +56,16 @@ if "update_success" not in st.session_state:
 
 # ----------------- Helper functions -----------------
 
-def create_barcode_pdf(barcodes):
+from io import BytesIO
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+from barcode import Code128
+from barcode.writer import ImageWriter
+import tempfile
+import os
+import contextlib
+
+def create_barcode_pdf(barcodes, skip_slots=0):
     pdf_buffer = BytesIO()
     c = canvas.Canvas(pdf_buffer, pagesize=letter)
     page_w, page_h = letter
@@ -68,58 +77,61 @@ def create_barcode_pdf(barcodes):
     cols = 3
     rows = 10
 
-    # Size of each slot
+    # Size of each sticker
     sticker_w = (page_w - 2 * margin_x - (cols - 1) * col_spacing) / cols
-    sticker_h = 60 # fixed height slot for each barcode
+    sticker_h = 60  # fixed height for each barcode
 
     # Compute total grid height for vertical centering
     grid_height = rows * sticker_h + (rows - 1) * row_spacing
     margin_y = (page_h - grid_height) / 2
 
-    col, row = 0, 0
+    # START POSITION BASED ON SKIP
+    col = skip_slots % cols
+    row = skip_slots // cols
     temp_files = []
+
     try:
         for label, _ in barcodes:
-            # generate barcode PNG without text
+            # Generate barcode image in memory
             barcode_obj = Code128(label, writer=ImageWriter())
             options = {
-                "module_width": 0.35,  # slightly wider bars
-                "module_height": 18,  # taller bars
-                "write_text": False    # no text inside barcode
+                "module_width": 0.35,
+                "module_height": 18,
+                "write_text": False
             }
             barcode_bytes = BytesIO()
             barcode_obj.write(barcode_bytes, options)
 
-            # write to temp file
+            # Save to a temporary file
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_img:
                 temp_img.write(barcode_bytes.getvalue())
                 temp_filepath = temp_img.name
                 temp_files.append(temp_filepath)
 
-            # position
+            # Calculate position
             x_pos = margin_x + col * (sticker_w + col_spacing)
             y_pos = page_h - margin_y - (row + 1) * sticker_h - row * row_spacing
 
-            # draw barcode image
+            # Draw the barcode image
             c.drawImage(
                 temp_filepath,
                 x_pos,
-                y_pos + 12, # shift up so label fits underneath
+                y_pos + 12,  # shift image up to make space for text
                 width=sticker_w,
                 height=sticker_h - 20,
                 preserveAspectRatio=True,
                 anchor='n'
             )
 
-            # draw label under barcode
+            # Draw the label under the image
             c.setFont("Helvetica-Bold", 10)
             c.drawCentredString(
                 x_pos + sticker_w / 2,
-                y_pos,  # directly under the image
+                y_pos,
                 label
             )
 
-            # move to next slot
+            # Move to next position
             col += 1
             if col >= cols:
                 col = 0
@@ -132,9 +144,11 @@ def create_barcode_pdf(barcodes):
         pdf_buffer.seek(0)
         return pdf_buffer.getvalue()
     finally:
+        # Clean up temp files
         for f in temp_files:
             with contextlib.suppress(OSError):
                 os.remove(f)
+
 
 # Ensure default admin exists in Supabase
 def ensure_default_admin():
@@ -823,9 +837,6 @@ def management_mode():
     # ---------- Create Anticipated Truck ----------
     st.subheader("Create Anticipated Truck")
 
-    # Keep track of slots assigned in this batch
-
-
     with st.form("create_truck_form", clear_on_submit=True):
         truck_name = st.text_input("Truck Name")
 
@@ -837,12 +848,20 @@ def management_mode():
         allowed_data = supabase.from_('allowed_items').select('item_name').order('item_name').execute().data
         allowed_items = [item['item_name'] for item in allowed_data]
 
+        # Quantity inputs
         qtys = {}
         for item in allowed_items:
             qtys[item] = st.number_input(f"{item} quantity", min_value=0, max_value=65, step=1, key=f"qty_{item}")
 
+        # NEW: Number of label slots to skip
+        skip_slots = st.number_input(
+            "Number of label slots to skip (for partially used sticker sheets)", 
+            min_value=0, max_value=29, step=1, value=0
+        )
+
         submit_button = st.form_submit_button("Generate Anticipated Truck")
 
+    # Handle form submission
     if submit_button:
         if not truck_name.strip():
             st.error("Please enter a name for the truck.")
@@ -850,7 +869,7 @@ def management_mode():
             try:
                 now = datetime.datetime.now().isoformat()
 
-                # Supabase: Insert truck and get the new row's ID
+                # Supabase: Insert truck and get ID
                 truck_response = supabase.from_('anticipated_trucks').insert({
                     'truck_name': truck_name,
                     'created_by': st.session_state.admin_username,
@@ -863,7 +882,7 @@ def management_mode():
                 barcodes = []
                 items_to_insert = []
 
-                # Reset batch_assigned_slots for this truck
+                # Reset batch_assigned_slots
                 batch_assigned_slots = {}
 
                 for item, qty in qtys.items():
@@ -879,11 +898,13 @@ def management_mode():
                         })
                         png = generate_barcode_bytes(label)
                         barcodes.append((label, png))
-                
+
                 # Supabase: Bulk insert anticipated items
                 supabase.from_('anticipated_items').insert(items_to_insert).execute()
-                
-                pdf_data = create_barcode_pdf(barcodes)
+
+                # NEW: Pass skip_slots to barcode PDF generator
+                pdf_data = create_barcode_pdf(barcodes, skip_slots=skip_slots)
+
                 st.download_button(
                     "Download 10x3 Sticker Sheet (PDF)",
                     data=pdf_data,
@@ -891,9 +912,12 @@ def management_mode():
                     mime="application/pdf",
                     key=f"download_{truck_name}_{datetime.datetime.now().timestamp()}"
                 )
+
                 st.success(f"Anticipated truck '{truck_name}' created for {selected_day}.")
+
             except Exception as e:
                 st.error(f"Error creating truck: {e}")
+
 
 
 

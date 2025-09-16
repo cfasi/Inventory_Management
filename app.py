@@ -477,22 +477,43 @@ def user_mode():
         st.session_state.manual_update_done = False
     if "manual_status_radio" not in st.session_state:
         st.session_state.manual_status_radio = "in_stock"  # default
+    if "user_scan_input" not in st.session_state:  
+        st.session_state.user_scan_input = ""
 
     # --- Show last update success message ---
     if st.session_state.update_success:
         st.success(st.session_state.update_success)
         st.session_state.update_success = None
 
-    # --- Scan input ---
+    # --- Scan input and clear button ---
+    # Initialize clear flag if it doesn't exist
+    if "clear_scan_box" not in st.session_state:
+        st.session_state.clear_scan_box = False
+
+    # Determine value to show in the text input
+    scan_value = "" if st.session_state.clear_scan_box else st.session_state.get("user_scan_input", "")
+    if st.session_state.clear_scan_box:
+        st.session_state.clear_scan_box = False
+        st.session_state.user_mode_scan_data = None  # Optional reset
+
+    # Show the scan input
     st.text_input(
         "Scan or enter barcode (format: itemcode_slot)",
         key="user_scan_input",
+        value=scan_value,
         on_change=handle_user_scan_auto
     )
+
+    # "Clear Box" button BELOW the input
+    if st.button("Clear Box"):
+        st.session_state.clear_scan_box = True
+        st.rerun()
+
 
     scan_data = st.session_state.user_mode_scan_data
     if not scan_data:
         return
+
 
     item_code = scan_data['item_code']
     slot = scan_data['slot']

@@ -343,6 +343,10 @@ def truck_mode():
         st.session_state.truck_username = ""
     st.markdown("---")
 
+    msg, sender = get_section_message("truck")
+    if msg:
+        st.info(f"📢 {msg}\n\n— *{sender}*")
+
     # --- 2. Truck Selection Section ---
     st.subheader("Select a Truck to Process")
     
@@ -466,6 +470,10 @@ def truck_mode():
 def user_mode():
     st.header("User Mode - Update Item Status")
 
+    msg, sender = get_section_message("truck")
+    if msg:
+        st.info(f"📢 {msg}\n\n— *{sender}*")
+
     # --- Initialize session state ---
     if "update_success" not in st.session_state:
         st.session_state.update_success = None
@@ -486,25 +494,21 @@ def user_mode():
         st.session_state.update_success = None
 
     # --- Scan input and clear button ---
-    # --- Scan input and clear button ---
-
-    # Initialize state variables
-    if "user_scan_input" not in st.session_state:
-        st.session_state.user_scan_input = ""
-
+    # Initialize clear flag if it doesn't exist
     if "clear_scan_box" not in st.session_state:
         st.session_state.clear_scan_box = False
 
-    # Reset if clear was triggered
+    # Determine value to show in the text input
+    scan_value = "" if st.session_state.clear_scan_box else st.session_state.get("user_scan_input", "")
     if st.session_state.clear_scan_box:
-        st.session_state.user_scan_input = ""      # clear input directly
         st.session_state.clear_scan_box = False
         st.session_state.user_mode_scan_data = None  # Optional reset
 
-    # Show the scan input (state-managed)
+    # Show the scan input
     st.text_input(
         "Scan or enter barcode (format: itemcode_slot)",
         key="user_scan_input",
+        value=scan_value,
         on_change=handle_user_scan_auto
     )
 
@@ -661,6 +665,10 @@ def admin_mode():
         st.session_state.pending_delete_user = None
 
     st.markdown("---")
+
+    msg, sender = get_section_message("truck")
+    if msg:
+        st.info(f"📢 {msg}\n\n— *{sender}*")
 
     # -------- Product summary --------
     st.subheader("Product Summary")
@@ -1252,6 +1260,54 @@ def analytics_mode():
 
 
 
+def messaging_mode():
+    st.header("Admin Messaging")
+
+    sections = ["user", "truck", "admin"]
+    section = st.selectbox("Write message to:", sections)
+    message = st.text_area("Message")
+
+    if st.button("Send / Replace Message"):
+        sender = st.session_state.get("admin_username", "Unknown Admin")
+
+        # Delete old message for this section
+        supabase.table("notifications").delete().eq("section", section).execute()
+
+        # Insert new message with sender
+        supabase.table("notifications").insert({
+            "section": section,
+            "message": message,
+            "sender": sender
+        }).execute()
+
+        st.success(f"Message for {section} updated by {sender}!")
+
+
+def get_section_message(section):
+    res = supabase.table("notifications") \
+        .select("message, sender") \
+        .eq("section", section) \
+        .order("created_at", desc=True) \
+        .limit(1) \
+        .execute()
+
+    if res.data:
+        return res.data[0]["message"], res.data[0]["sender"]
+    return None, None
+
+
+def manage_messages():
+    st.subheader("Current Messages")
+    res = supabase.table("notifications").select("*").execute()
+
+    for row in res.data:
+        st.write(f"**{row['section']}** → {row['message']} (from: {row['sender']})")
+        if st.button(f"Delete {row['section']} ({row['id']})", key=f"delete_{row['id']}"):
+            supabase.table("notifications").delete().eq("id", row["id"]).execute()
+            st.success(f"Deleted message for {row['section']}")
+            st.rerun()
+
+
 
 # ----------------- Main Mode Selector -----------------
 
@@ -1264,7 +1320,7 @@ if "last_processed_scan" not in st.session_state:
     st.session_state.last_processed_scan = ""
 
 
-mode = st.sidebar.selectbox("Select Mode", ["User Mode", "Truck Mode", "Admin Mode", "Truck Management", "Analytics Mode"], index=0)
+mode = st.sidebar.selectbox("Select Mode", ["User Mode", "Truck Mode", "Admin Mode", "Truck Management", "Analytics Mode", "Notifications Mode"], index=0)
 
 if mode == "User Mode":
     user_mode()
@@ -1276,5 +1332,19 @@ elif mode == "Truck Management":
     management_mode()
 elif mode == "Analytics Mode":
     analytics_mode()
+elif mode == "Notifications Mode":
+    if st.session_state.admin_logged_in:  
+        st.header("Notifications")
+
+        tab1, tab2 = st.tabs(["Send / Replace Message", "Manage Messages"])
+
+        with tab1:
+            messaging_mode()  
+
+        with tab2:
+            manage_messages()
+    else:
+        st.warning("You must be logged in as an admin to view this page.")
+
 
 

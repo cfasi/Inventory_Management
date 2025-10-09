@@ -301,12 +301,12 @@ def get_next_slot(item_code):
     highest_used = max(used_slots) if used_slots else 0
 
     # Step 2: Assign next slot if it's within range
-    if highest_used < 65:
+    if highest_used < 99:
         next_slot = highest_used + 1
         batch_assigned_slots[item_code].add(next_slot)
         return next_slot
 
-    # Step 3: Wrap to lowest depleted slot if all 1-65 are used
+    # Step 3: Wrap to lowest depleted slot if all 1-99 are used
     available_slots = sorted(depleted_slots - used_slots)
     if available_slots:
         slot = available_slots[0]
@@ -486,7 +486,6 @@ def user_mode():
         st.session_state.update_success = None
 
     # --- Scan input and clear button ---
-    # --- Scan input and clear button ---
 
     # Initialize state variables
     if "user_scan_input" not in st.session_state:
@@ -497,9 +496,9 @@ def user_mode():
 
     # Reset if clear was triggered
     if st.session_state.clear_scan_box:
-        st.session_state.user_scan_input = ""      # clear input directly
+        st.session_state.user_scan_input = ""      
         st.session_state.clear_scan_box = False
-        st.session_state.user_mode_scan_data = None  # Optional reset
+        st.session_state.user_mode_scan_data = None  
 
     # Show the scan input (state-managed)
     st.text_input(
@@ -876,7 +875,7 @@ def management_mode():
         # Quantity inputs
         qtys = {}
         for item in allowed_items:
-            qtys[item] = st.number_input(f"{item} quantity", min_value=0, max_value=65, step=1, key=f"qty_{item}")
+            qtys[item] = st.number_input(f"{item} quantity", min_value=0, max_value=99, step=1, key=f"qty_{item}")
 
         # NEW: Number of label slots to skip
         skip_slots = st.number_input(

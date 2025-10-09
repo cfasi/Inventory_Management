@@ -486,21 +486,24 @@ def user_mode():
         st.session_state.update_success = None
 
     # --- Scan input and clear button ---
-    # Initialize clear flag if it doesn't exist
+
+    # Initialize state variables
+    if "user_scan_input" not in st.session_state:
+        st.session_state.user_scan_input = ""
+
     if "clear_scan_box" not in st.session_state:
         st.session_state.clear_scan_box = False
 
-    # Determine value to show in the text input
-    scan_value = "" if st.session_state.clear_scan_box else st.session_state.get("user_scan_input", "")
+    # Reset if clear was triggered
     if st.session_state.clear_scan_box:
+        st.session_state.user_scan_input = ""      
         st.session_state.clear_scan_box = False
-        st.session_state.user_mode_scan_data = None  # Optional reset
+        st.session_state.user_mode_scan_data = None  
 
-    # Show the scan input
+    # Show the scan input (state-managed)
     st.text_input(
         "Scan or enter barcode (format: itemcode_slot)",
         key="user_scan_input",
-        value=scan_value,
         on_change=handle_user_scan_auto
     )
 

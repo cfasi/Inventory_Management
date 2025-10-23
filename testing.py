@@ -305,35 +305,37 @@ def get_next_slot(item_code):
     if item_code not in batch_assigned_slots:
         batch_assigned_slots[item_code] = set()
 
-    # Fetch current and anticipated slots
-    inventory_items = supabase.from_('inventory') \
-        .select('slot, status') \
-        .eq('item_code', item_code) \
-        .execute().data
-    anticipated_items = supabase.from_('anticipated_items') \
-        .select('slot') \
-        .eq('item_code', item_code) \
-        .execute().data
+    # Fetch current and anticipated slots safely
+    inventory_items = (supabase.from_('inventory')
+                       .select('slot, status')
+                       .eq('item_code', item_code)
+                       .execute().data) or []
+    anticipated_items = (supabase.from_('anticipated_items')
+                         .select('slot')
+                         .eq('item_code', item_code)
+                         .execute().data) or []
 
-    # Collect slots currently in use or anticipated
-    used_slots = {
-        int(item['slot']) for item in inventory_items if item.get('slot')
-    } | {
-        int(item['slot']) for item in anticipated_items if item.get('slot')
-    } | batch_assigned_slots[item_code]
+    # Collect all used slots
+    used_slots = {int(item['slot']) for item in inventory_items if item.get('slot')}
+    used_slots |= {int(item['slot']) for item in anticipated_items if item.get('slot')}
+    used_slots |= batch_assigned_slots[item_code]
 
-    # Step 1: Find first open slot from 1–99
-    all_slots = set(range(1, 100))
-    available_slots = sorted(all_slots - used_slots)
-
-    if available_slots:
-        next_slot = available_slots[0]
+    # Find the next slot incrementally
+    if used_slots:
+        last_slot = max(used_slots)
     else:
-        # fallback — extremely rare, means all 1–99 are somehow used
-        next_slot = 1
+        last_slot = 0
 
-    batch_assigned_slots[item_code].add(next_slot)
-    return next_slot
+    next_slot = last_slot
+    for _ in range(99):  # max 99 tries to avoid infinite loop
+        next_slot = (next_slot % 99) + 1  # wraps from 99 → 1
+        if next_slot not in used_slots:
+            batch_assigned_slots[item_code].add(next_slot)
+            return next_slot
+
+    # If all slots somehow taken
+    raise RuntimeError(f"No available slots for item_code {item_code}")
+
 
 
 

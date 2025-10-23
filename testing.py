@@ -1,6 +1,5 @@
 # app.py
 import streamlit as st
-import datetime
 import pandas as pd
 from barcode import Code128
 from barcode.writer import ImageWriter
@@ -64,6 +63,37 @@ from barcode.writer import ImageWriter
 import tempfile
 import os
 import contextlib
+
+from datetime import datetime, timedelta
+
+def move_depleted_to_history():
+    one_day_ago = datetime.utcnow() - timedelta(days=1)
+
+    # Explicitly select id to make sure it's included
+    response = supabase.from_("inventory") \
+        .select("id, item_code, slot, status, depleted_at, added_by, added_at, truck_id") \
+        .lte("depleted_at", one_day_ago.isoformat()) \
+        .execute()
+
+    if not response.data:
+        print("No depleted items found to move.")
+        return
+
+    depleted_rows = response.data
+
+    # Remove id before inserting into history
+    for row in depleted_rows:
+        row.pop("id", None)
+
+    # Insert into history
+    supabase.from_("history").insert(depleted_rows).execute()
+
+    # Delete original inventory rows
+    ids_to_delete = [row.get("id") for row in response.data if "id" in row]
+    if ids_to_delete:
+        supabase.from_("inventory").delete().in_("id", ids_to_delete).execute()
+
+
 
 def create_barcode_pdf(barcodes, skip_slots=0):
     pdf_buffer = BytesIO()
@@ -253,7 +283,7 @@ def check_login(username, password_input):
     return False, None
 
 def close_truck(truck_id, closed_by):
-    now = datetime.datetime.now().isoformat()
+    now = datetime.now().isoformat()
     
     # Supabase: Mark anticipated truck as closed
     supabase.from_('anticipated_trucks').update({'status': 'closed'}).eq('id', truck_id).execute()
@@ -268,13 +298,14 @@ def close_truck(truck_id, closed_by):
     st.success(f"Truck {truck_id} closed by {closed_by} at {now}.")
 
 
+
 batch_assigned_slots = {}
 
 def get_next_slot(item_code):
     if item_code not in batch_assigned_slots:
         batch_assigned_slots[item_code] = set()
 
-    # Fetch slots from inventory (ignore depleted)
+    # Fetch current and anticipated slots
     inventory_items = supabase.from_('inventory') \
         .select('slot, status') \
         .eq('item_code', item_code) \
@@ -284,42 +315,31 @@ def get_next_slot(item_code):
         .eq('item_code', item_code) \
         .execute().data
 
-    # Get sets of slots
+    # Collect slots currently in use or anticipated
     used_slots = {
-        int(item['slot']) for item in inventory_items
-        if item.get('slot') and item.get('status') != 'depleted'
+        int(item['slot']) for item in inventory_items if item.get('slot')
     } | {
         int(item['slot']) for item in anticipated_items if item.get('slot')
     } | batch_assigned_slots[item_code]
 
-    depleted_slots = {
-        int(item['slot']) for item in inventory_items
-        if item.get('slot') and item.get('status') == 'depleted'
-    }
+    # Step 1: Find first open slot from 1–99
+    all_slots = set(range(1, 100))
+    available_slots = sorted(all_slots - used_slots)
 
-    # Step 1: Find the highest used slot
-    highest_used = max(used_slots) if used_slots else 0
-
-    # Step 2: Assign next slot if it's within range
-    if highest_used < 65:
-        next_slot = highest_used + 1
-        batch_assigned_slots[item_code].add(next_slot)
-        return next_slot
-
-    # Step 3: Wrap to lowest depleted slot if all 1-65 are used
-    available_slots = sorted(depleted_slots - used_slots)
     if available_slots:
-        slot = available_slots[0]
+        next_slot = available_slots[0]
     else:
-        slot = 1  # fallback if nothing else is open
+        # fallback — extremely rare, means all 1–99 are somehow used
+        next_slot = 1
 
-    batch_assigned_slots[item_code].add(slot)
-    return slot
-
+    batch_assigned_slots[item_code].add(next_slot)
+    return next_slot
 
 
 
 # ----------------- Mode functions -----------------
+move_depleted_to_history()
+
 def truck_mode():
     st.header("Truck Mode")
 
@@ -342,10 +362,6 @@ def truck_mode():
         st.session_state.truck_logged_in = False
         st.session_state.truck_username = ""
     st.markdown("---")
-
-    msg, sender = get_section_message("truck")
-    if msg:
-        st.info(f"📢 {msg}\n\n— *{sender}*")
 
     # --- 2. Truck Selection Section ---
     st.subheader("Select a Truck to Process")
@@ -381,12 +397,12 @@ def truck_mode():
     
     if submit_button and scan:
         # Supabase: Check if barcode is pending for the selected truck
-        scan_data = supabase.from_('anticipated_items').select('id, item_code, slot').eq('barcode_label', scan).eq('status', 'pending').eq('truck_id', st.session_state.current_truck_id).execute().data
+        scan_data = supabase.from_('anticipated_items').select('id, item_code, slot, status').eq('barcode_label', scan).eq('status', 'pending').eq('truck_id', st.session_state.current_truck_id).execute().data
         
         if scan_data:
             row = scan_data[0]
             aid, code, slot = row['id'], row['item_code'], row['slot']
-            now = datetime.datetime.now().isoformat()
+            now = datetime.now().isoformat()
             
             try:
                 # Supabase: Mark anticipated item as scanned
@@ -403,6 +419,8 @@ def truck_mode():
                     'truck_id': st.session_state.current_truck_id
                 }).execute()
                 
+                supabase.from_('anticipated_items').delete().eq('id', aid).execute()
+
                 st.success(f"Barcode `{scan}` successfully received for truck {st.session_state.current_truck_id}.")
             except Exception as e:
                 st.error(f"Error: An item with this barcode might already exist in inventory. Details: {e}")
@@ -414,7 +432,8 @@ def truck_mode():
     # --- 4. Reprint & Emergency Add Sections ---
     st.subheader("Reprint Existing Barcode")
     # Supabase: Fetch items in stock
-    in_stock_data = supabase.from_('inventory').select('item_code, slot').eq('status', 'in_stock').execute().data
+    in_stock_data = supabase.from_('inventory').select('item_code, slot, status').eq('status', 'in_stock').execute().data
+
     df = pd.DataFrame(in_stock_data)
 
     if not df.empty:
@@ -438,7 +457,8 @@ def truck_mode():
             if st.form_submit_button("Add Emergency Item"):
                 slot = get_next_slot(e_item)
                 label = f"{e_item}_{slot}"
-                now = datetime.datetime.now().isoformat()
+                now = datetime.now().isoformat()
+
                 
                 try:
                     # Supabase: Insert into inventory
@@ -470,10 +490,6 @@ def truck_mode():
 def user_mode():
     st.header("User Mode - Update Item Status")
 
-    msg, sender = get_section_message("truck")
-    if msg:
-        st.info(f"📢 {msg}\n\n— *{sender}*")
-
     # --- Initialize session state ---
     if "update_success" not in st.session_state:
         st.session_state.update_success = None
@@ -494,21 +510,24 @@ def user_mode():
         st.session_state.update_success = None
 
     # --- Scan input and clear button ---
-    # Initialize clear flag if it doesn't exist
+
+    # Initialize state variables
+    if "user_scan_input" not in st.session_state:
+        st.session_state.user_scan_input = ""
+
     if "clear_scan_box" not in st.session_state:
         st.session_state.clear_scan_box = False
 
-    # Determine value to show in the text input
-    scan_value = "" if st.session_state.clear_scan_box else st.session_state.get("user_scan_input", "")
+    # Reset if clear was triggered
     if st.session_state.clear_scan_box:
+        st.session_state.user_scan_input = ""      
         st.session_state.clear_scan_box = False
-        st.session_state.user_mode_scan_data = None  # Optional reset
+        st.session_state.user_mode_scan_data = None  
 
-    # Show the scan input
+    # Show the scan input (state-managed)
     st.text_input(
         "Scan or enter barcode (format: itemcode_slot)",
         key="user_scan_input",
-        value=scan_value,
         on_change=handle_user_scan_auto
     )
 
@@ -621,7 +640,7 @@ def user_mode():
 # The function below needs to be defined BEFORE it is called.
 # It was in your previous prompt but it is important to include here too.
 def process_scan_and_update(new_status, item_code, slot):
-    now = datetime.datetime.now().isoformat()
+    now = datetime.now().isoformat()
     update_data = {'status': new_status}
     
     if new_status == 'in_use':
@@ -666,10 +685,6 @@ def admin_mode():
 
     st.markdown("---")
 
-    msg, sender = get_section_message("truck")
-    if msg:
-        st.info(f"📢 {msg}\n\n— *{sender}*")
-
     # -------- Product summary --------
     st.subheader("Product Summary")
     # Supabase: Fetch data for product summary
@@ -710,27 +725,48 @@ def admin_mode():
 
     # -------- Inventory summary + durations --------
     st.subheader("Inventory Overview")
+
     # Supabase: Fetch all inventory data
     try:
-        inventory_data = supabase.from_('inventory').select('item_code, slot, status, in_stock_at, in_use_at, depleted_at, added_at').order('item_code').order('slot').execute().data
+        inventory_data = (
+            supabase
+            .from_('inventory')
+            .select('item_code, slot, status, in_stock_at, in_use_at, depleted_at, added_at')
+            .order('item_code')
+            .order('slot')
+            .execute()
+            .data
+        )
+        
         df = pd.DataFrame(inventory_data)
 
         if not df.empty:
             # Convert timestamp columns to datetime objects
-            df["in_stock_at"] = pd.to_datetime(df["in_stock_at"])
-            df["in_use_at"] = pd.to_datetime(df["in_use_at"])
-            df["depleted_at"] = pd.to_datetime(df["depleted_at"])
-            
+            for col in ["in_stock_at", "in_use_at", "depleted_at"]:
+                df[col] = pd.to_datetime(df[col])
+
             # Calculate durations in days
             df["Days In Stock"] = (df["in_use_at"] - df["in_stock_at"]).dt.days
             df["Days In Use"] = (df["depleted_at"] - df["in_use_at"]).dt.days
             df["Total Days"] = (df["depleted_at"] - df["in_stock_at"]).dt.days
-            
-            st.dataframe(df)
+
+            # --- Dropdown to filter by item ---
+            item_list = ["All Items"] + sorted(df["item_code"].dropna().unique().tolist())
+            selected_item = st.selectbox("Select Item to View", item_list)
+
+            # Filter the dataframe based on selection
+            if selected_item != "All Items":
+                df = df[df["item_code"] == selected_item]
+
+            # Display filtered dataframe
+            st.dataframe(df, use_container_width=True)
+
         else:
             st.info("No items in inventory to display.")
+
     except Exception as e:
         st.error(f"Error fetching inventory overview: {e}")
+
 
     # -------- Allowed items management --------
     st.subheader("Allowed Items")
@@ -884,7 +920,7 @@ def management_mode():
         # Quantity inputs
         qtys = {}
         for item in allowed_items:
-            qtys[item] = st.number_input(f"{item} quantity", min_value=0, max_value=65, step=1, key=f"qty_{item}")
+            qtys[item] = st.number_input(f"{item} quantity", min_value=0, max_value=99, step=1, key=f"qty_{item}")
 
         # NEW: Number of label slots to skip
         skip_slots = st.number_input(
@@ -900,7 +936,7 @@ def management_mode():
             st.error("Please enter a name for the truck.")
         else:
             try:
-                now = datetime.datetime.now().isoformat()
+                now = datetime.now().isoformat()
 
                 # Supabase: Insert truck and get ID
                 truck_response = supabase.from_('anticipated_trucks').insert({
@@ -915,8 +951,7 @@ def management_mode():
                 barcodes = []
                 items_to_insert = []
 
-                # Reset batch_assigned_slots
-                batch_assigned_slots = {}
+
 
                 for item, qty in qtys.items():
                     for _ in range(qty):
@@ -943,7 +978,7 @@ def management_mode():
                     data=pdf_data,
                     file_name=f"{truck_name}_barcodes.pdf",
                     mime="application/pdf",
-                    key=f"download_{truck_name}_{datetime.datetime.now().timestamp()}"
+                    key=f"download_{truck_name}_{datetime.now().timestamp()}"
                 )
 
                 st.success(f"Anticipated truck '{truck_name}' created for {selected_day}.")
@@ -970,10 +1005,18 @@ def management_mode():
         df_items_data = supabase.from_('anticipated_items').select('*').eq('truck_id', t_id).execute().data
         df_items = pd.DataFrame(df_items_data)
 
+
+
+
         total_count = len(df_items)
-        received_count = len(df_items[df_items["status"] == "scanned"])
-        missing_count = len(df_items[df_items["status"] == "missing"])
-        pending_count = len(df_items[df_items["status"] == "pending"])
+
+        if "status" in df_items.columns:
+            received_count = len(df_items[df_items["status"] == "scanned"])
+            missing_count = len(df_items[df_items["status"] == "missing"])
+            pending_count = len(df_items[df_items["status"] == "pending"])
+        else:
+            received_count = missing_count = pending_count = 0
+
         
         st.markdown(f"""
         **Summary for Truck ID {t_id}:**
@@ -983,8 +1026,12 @@ def management_mode():
         - Pending Scans: **{pending_count}**
         """)
 
-        breakdown = df_items.groupby(["item_code", "status"]).size().unstack(fill_value=0)
-        st.dataframe(breakdown)
+        if not df_items.empty and "item_code" in df_items.columns and "status" in df_items.columns:
+            breakdown = df_items.groupby(["item_code", "status"]).size().unstack(fill_value=0)
+            st.dataframe(breakdown)
+        else:
+            st.info("No anticipated items found for this truck.")
+
 
         # Actions for selected truck
         st.markdown("---")
@@ -1012,58 +1059,65 @@ def management_mode():
                     st.warning("No barcodes to reprint for this truck.")
 
         # --- Close Truck Button ---
-        truck_name = trucks[trucks['id'] == t_id]['truck_name'].iloc[0]
+        truck_data = trucks[trucks['id'] == t_id].iloc[0]
+        truck_name = truck_data['truck_name']
+        truck_status = truck_data['status']  # Assuming your table has this column
 
         with col2:
-            if pending_count > 0:
-                if st.button(f"Close {truck_name} (Mark Pending as Missing)", key=f"close_truck_{t_id}"):
-                    now = datetime.datetime.now().isoformat()
-                    
-                    # Supabase: Get counts
-                    total_items = len(df_items)
-                    items_processed = len(df_items[df_items['status'] == 'scanned'])
-                    
-                    # Supabase: Update pending items as missing
-                    supabase.from_('anticipated_items').update({'status': 'missing'}).eq('truck_id', t_id).eq('status', 'pending').execute()
-
-                    # Supabase: Update truck status to closed
-                    supabase.from_('anticipated_trucks').update({'status': 'closed'}).eq('id', t_id).execute()
-
-                    # Supabase: Insert into analytics history
-                    supabase.from_('analytics_history').insert({
-                        'truck_id': t_id,
-                        'closed_by': st.session_state.admin_username,
-                        'closed_at': now,
-                        'items_processed': items_processed,
-                        'items_missing': pending_count,
-                        'total_items': total_items
-                    }).execute()
-                    
-                    st.success(f"Truck **{truck_name}** closed. Missing items marked.")
-                    st.rerun()
+            if truck_status == 'closed':
+                st.info(f"Truck **{truck_name}** is already closed.")
             else:
-                if st.button(f"Close {truck_name}", key=f"force_close_{t_id}"):
-                    now = datetime.datetime.now().isoformat()
-                    
-                    # Supabase: Get counts
-                    total_items = len(df_items)
-                    items_processed = len(df_items[df_items['status'] == 'scanned'])
-                    
-                    # Supabase: Update truck status to closed
-                    supabase.from_('anticipated_trucks').update({'status': 'closed'}).eq('id', t_id).execute()
+                if pending_count > 0:
+                    if st.button(f"Close {truck_name} (Mark Pending as Missing)", key=f"close_truck_{t_id}"):
+                        now = datetime.now().isoformat()
 
-                    # Supabase: Insert into analytics history
-                    supabase.from_('analytics_history').insert({
-                        'truck_id': t_id,
-                        'closed_by': st.session_state.admin_username,
-                        'closed_at': now,
-                        'items_processed': items_processed,
-                        'items_missing': 0,
-                        'total_items': total_items
-                    }).execute()
-                    
-                    st.success(f"Truck **{truck_name}** closed. All items already processed.")
-                    st.rerun()
+                        # Supabase: Get counts
+                        total_items = len(df_items)
+                        items_processed = len(df_items[df_items['status'] == 'scanned'])
+
+                        # Supabase: Update pending items as missing
+                        supabase.from_('anticipated_items').update({'status': 'missing'}) \
+                            .eq('truck_id', t_id).eq('status', 'pending').execute()
+
+                        # Supabase: Update truck status to closed
+                        supabase.from_('anticipated_trucks').update({'status': 'closed'}).eq('id', t_id).execute()
+
+                        # Supabase: Insert into analytics history
+                        supabase.from_('analytics_history').insert({
+                            'truck_id': t_id,
+                            'closed_by': st.session_state.admin_username,
+                            'closed_at': now,
+                            'items_processed': items_processed,
+                            'items_missing': pending_count,
+                            'total_items': total_items
+                        }).execute()
+
+                        st.success(f"Truck **{truck_name}** closed. Missing items marked.")
+                        st.rerun()
+                else:
+                    if st.button(f"Close {truck_name}", key=f"force_close_{t_id}"):
+                        now = datetime.now().isoformat()
+
+                        # Supabase: Get counts
+                        total_items = len(df_items)
+                        items_processed = len(df_items[df_items['status'] == 'scanned'])
+
+                        # Supabase: Update truck status to closed
+                        supabase.from_('anticipated_trucks').update({'status': 'closed'}).eq('id', t_id).execute()
+
+                        # Supabase: Insert into analytics history
+                        supabase.from_('analytics_history').insert({
+                            'truck_id': t_id,
+                            'closed_by': st.session_state.admin_username,
+                            'closed_at': now,
+                            'items_processed': items_processed,
+                            'items_missing': 0,
+                            'total_items': total_items
+                        }).execute()
+
+                        st.success(f"Truck **{truck_name}** closed. All items already processed.")
+                        st.rerun()
+
 
         # --- Delete Truck with Double Verification ---
         if "confirm_delete_truck" not in st.session_state:
@@ -1260,54 +1314,6 @@ def analytics_mode():
 
 
 
-def messaging_mode():
-    st.header("Admin Messaging")
-
-    sections = ["user", "truck", "admin"]
-    section = st.selectbox("Write message to:", sections)
-    message = st.text_area("Message")
-
-    if st.button("Send / Replace Message"):
-        sender = st.session_state.get("admin_username", "Unknown Admin")
-
-        # Delete old message for this section
-        supabase.table("notifications").delete().eq("section", section).execute()
-
-        # Insert new message with sender
-        supabase.table("notifications").insert({
-            "section": section,
-            "message": message,
-            "sender": sender
-        }).execute()
-
-        st.success(f"Message for {section} updated by {sender}!")
-
-
-def get_section_message(section):
-    res = supabase.table("notifications") \
-        .select("message, sender") \
-        .eq("section", section) \
-        .order("created_at", desc=True) \
-        .limit(1) \
-        .execute()
-
-    if res.data:
-        return res.data[0]["message"], res.data[0]["sender"]
-    return None, None
-
-
-def manage_messages():
-    st.subheader("Current Messages")
-    res = supabase.table("notifications").select("*").execute()
-
-    for row in res.data:
-        st.write(f"**{row['section']}** → {row['message']} (from: {row['sender']})")
-        if st.button(f"Delete {row['section']} ({row['id']})", key=f"delete_{row['id']}"):
-            supabase.table("notifications").delete().eq("id", row["id"]).execute()
-            st.success(f"Deleted message for {row['section']}")
-            st.rerun()
-
-
 
 # ----------------- Main Mode Selector -----------------
 
@@ -1320,7 +1326,7 @@ if "last_processed_scan" not in st.session_state:
     st.session_state.last_processed_scan = ""
 
 
-mode = st.sidebar.selectbox("Select Mode", ["User Mode", "Truck Mode", "Admin Mode", "Truck Management", "Analytics Mode", "Notifications Mode"], index=0)
+mode = st.sidebar.selectbox("Select Mode", ["User Mode", "Truck Mode", "Admin Mode", "Truck Management", "Analytics Mode"], index=0)
 
 if mode == "User Mode":
     user_mode()
@@ -1332,19 +1338,5 @@ elif mode == "Truck Management":
     management_mode()
 elif mode == "Analytics Mode":
     analytics_mode()
-elif mode == "Notifications Mode":
-    if st.session_state.admin_logged_in:  
-        st.header("Notifications")
-
-        tab1, tab2 = st.tabs(["Send / Replace Message", "Manage Messages"])
-
-        with tab1:
-            messaging_mode()  
-
-        with tab2:
-            manage_messages()
-    else:
-        st.warning("You must be logged in as an admin to view this page.")
-
 
 

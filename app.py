@@ -1316,3 +1316,6 @@ elif mode == "Truck Management":
     management_mode()
 elif mode == "Analytics Mode":
     analytics_mode()
+
+
+# jan 17., 2026
